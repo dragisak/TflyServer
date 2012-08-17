@@ -169,12 +169,13 @@ public class TflyServer {
                     CharBuffer charBuffer = decoder.decode(buffer);
                     charBuffer.flip();
                     String input = new String(charBuffer.array());
-                    if (input.indexOf(4) >= 0) {  // EOT, ctrl-D received
+                    if (input.indexOf(4) >= 0) {
+                        // EOT, ctrl-D received
                         System.out.println("Closing connection with " + socketChannel.socket().getInetAddress().getHostAddress());
                         key.cancel();
                         socketChannel.close();
                     } else {
-                        // Queu for writing
+                        // Queue for writing
                         writer.write(socketChannel, input);
                     }
                 }
