@@ -1,5 +1,7 @@
 package com.dragishak;
 
+import com.ticketfly.TFlyService;
+
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
@@ -28,6 +30,9 @@ public class TflyServer {
     private static final int DEFAULT_PORT = 4567;
 
 
+    private static TFlyService service = new TFlyService();
+
+
     /**
      * Writing is done by a separate thread. Requests are queued via BlockingQueue.
      * <p/>
@@ -51,10 +56,10 @@ public class TflyServer {
 
             try {
                 while (true) {
-                    Message payload = queue.take(); // will wait until there are messages in queue
+                    Message message = queue.take(); // will wait until there are messages in queue
 
                     // Now split
-                    Matcher matcher = regex.matcher(payload.getText());
+                    Matcher matcher = regex.matcher(message.getText());
                     if (matcher.find()) {
                         String word = matcher.group();
                         if (word != null) {
@@ -68,10 +73,14 @@ public class TflyServer {
                                     }
                                 }
                             }
-                            String response = reverse(word.trim()) + " " + Long.toString(counter++) + "\n";
                             try {
-                                payload.getChannel().write(ByteBuffer.wrap(response.getBytes()));
+                                String response = service.execute(word.trim()) + " " + Long.toString(counter++) + "\n";
+                                message.getChannel().write(ByteBuffer.wrap(response.getBytes()));
                                 // TODO: Check if all bytes are written. If not, queue and register selector with OP_WRITE
+                            } catch (TFlyService.TFlyServiceException e) {
+                                // we got error. Put the message back on the end of the queue. Be fair and don't block.
+                                e.printStackTrace();
+                                queue.put(message);
                             } catch (IOException e) {
                                 e.printStackTrace();
                             }
@@ -84,15 +93,6 @@ public class TflyServer {
                 e.printStackTrace();
             }
         }
-
-        private String reverse(String input) {
-            char[] reversed = new char[input.length()];
-            for (int i = 0; i < input.length(); i++) {
-                reversed[input.length() - i - 1] = input.charAt(i);
-            }
-            return new String(reversed);
-        }
-
     }
 
     /**
