@@ -28,14 +28,20 @@ public class TflyServer {
     private static final int DEFAULT_PORT = 4567;
 
 
+    /**
+     * Writing is done by a separate thread. Requests are queued via BlockingQueue.
+     * <p/>
+     * I am not worrying about socket buffer overflow for now.
+     */
     public static class Writer implements Runnable {
 
-        private final BlockingQueue<Payload> queue = new LinkedBlockingQueue<Payload>();
+        private final BlockingQueue<Message> queue = new LinkedBlockingQueue<Message>();
+        private final Pattern regex = Pattern.compile(".?([a-zA-Z0-9_]+).?");
         private long counter = 0;
 
 
-        public void write(SocketChannel channel, String text, Long newCounter) throws InterruptedException {
-            queue.put(new Payload(channel, text, newCounter));
+        public void write(SocketChannel channel, String text) throws InterruptedException {
+            queue.put(new Message(channel, text));
         }
 
 
@@ -45,16 +51,34 @@ public class TflyServer {
 
             try {
                 while (true) {
-                    Payload payload = queue.take();
-                    try {
-                        if (payload.getResetCounter() != null) {
-                            counter = payload.getResetCounter();
+                    Message payload = queue.take(); // will wait until there are messages in queue
+
+                    // Now split
+                    Matcher matcher = regex.matcher(payload.getText());
+                    if (matcher.find()) {
+                        String word = matcher.group();
+                        if (word != null) {
+                            if (matcher.find()) {
+                                String secondWord = matcher.group();
+                                if (secondWord != null) {
+                                    try {
+                                        counter = Long.parseLong(secondWord) + 1;
+                                    } catch (NumberFormatException e) {
+                                        e.printStackTrace();
+                                    }
+                                }
+                            }
+                            String response = reverse(word.trim()) + " " + Long.toString(counter++) + "\n";
+                            try {
+                                payload.getChannel().write(ByteBuffer.wrap(response.getBytes()));
+                                // TODO: Check if all bytes are written. If not, queue and register selector with OP_WRITE
+                            } catch (IOException e) {
+                                e.printStackTrace();
+                            }
                         }
-                        String response = reverse(payload.getText()) + " " + Long.toString(counter++) + "\n";
-                        int bytesWritten = payload.getChannel().write(ByteBuffer.wrap(response.getBytes()));
-                    } catch (IOException e) {
-                        e.printStackTrace();
                     }
+
+
                 }
             } catch (InterruptedException e) {
                 e.printStackTrace();
@@ -71,13 +95,17 @@ public class TflyServer {
 
     }
 
+    /**
+     * Server thread just handles selector events.
+     * <p/>
+     * Data read is just passed to Writer thread.
+     */
     public static class Server implements Runnable {
 
         private final Selector selector;
         private final Writer writer;
         private final ByteBuffer buffer = ByteBuffer.allocate(BUFFER_SIZE);
         private final CharsetDecoder decoder = Charset.defaultCharset().newDecoder();
-        private final Pattern regex = Pattern.compile(".?([a-zA-Z0-9_]+).?");
 
         public Server(int port, Writer writer) throws IOException {
             this.selector = SelectorProvider.provider().openSelector();
@@ -107,49 +135,9 @@ public class TflyServer {
 
                             if (key.isValid()) {
                                 if (key.isAcceptable()) {
-                                    ServerSocketChannel serverSocketChannel = (ServerSocketChannel) key.channel();
-                                    SocketChannel socketChannel = serverSocketChannel.accept();
-                                    socketChannel.configureBlocking(false);
-                                    System.out.println("Accept connection from " + socketChannel.socket().getInetAddress().getHostAddress());
-
-                                    // Start waiting for user input
-                                    socketChannel.register(this.selector, SelectionKey.OP_READ);
+                                    acceptConnection(key);
                                 } else if (key.isReadable()) {
-                                    SocketChannel socketChannel = (SocketChannel) key.channel();
-                                    buffer.clear();
-                                    decoder.reset();
-                                    int numRead;
-                                    try {
-
-                                        numRead = socketChannel.read(buffer);
-
-                                        if (numRead == -1) {
-                                            // EndOfStream reached
-                                            System.out.println("User closed connection with " + socketChannel.socket().getInetAddress().getHostAddress());
-                                            key.channel().close();
-                                            key.cancel();
-                                        } else {
-                                            buffer.flip();
-                                            CharBuffer charBuffer = decoder.decode(buffer);
-                                            charBuffer.flip();
-                                            String input = new String(charBuffer.array());
-                                            Matcher matcher = regex.matcher(input);
-                                            if (matcher.find()) {
-                                                String word = matcher.group();
-                                                if (word != null) {
-                                                    writer.write(socketChannel, word, null);
-                                                }
-                                            }
-                                        }
-                                    } catch (IOException e) {
-                                        System.out.println("Error reading from channel. Closing connection with " + socketChannel.socket().getInetAddress().getHostAddress());
-                                        key.cancel();
-                                        socketChannel.close();
-                                    }
-
-
-                                } else if (key.isWritable()) {
-
+                                    read(key);
                                 }
                             }
                         }
@@ -163,16 +151,58 @@ public class TflyServer {
             }
         }
 
+        private void read(SelectionKey key) throws InterruptedException, IOException {
+            SocketChannel socketChannel = (SocketChannel) key.channel();
+            buffer.clear();
+            try {
+
+                int numRead = socketChannel.read(buffer);
+
+                if (numRead == -1) {
+                    // EndOfStream reached
+                    System.out.println("User closed connection with " + socketChannel.socket().getInetAddress().getHostAddress());
+                    key.channel().close();
+                    key.cancel();
+                } else {
+                    buffer.flip();
+                    decoder.reset();
+                    CharBuffer charBuffer = decoder.decode(buffer);
+                    charBuffer.flip();
+                    String input = new String(charBuffer.array());
+                    if (input.indexOf(4) >= 0) {  // EOT, ctrl-D received
+                        System.out.println("Closing connection with " + socketChannel.socket().getInetAddress().getHostAddress());
+                        key.cancel();
+                        socketChannel.close();
+                    } else {
+                        // Queu for writing
+                        writer.write(socketChannel, input);
+                    }
+                }
+            } catch (IOException e) {
+                System.out.println("Error reading from channel. Closing connection with " + socketChannel.socket().getInetAddress().getHostAddress());
+                key.cancel();
+                socketChannel.close();
+            }
+        }
+
+        private void acceptConnection(SelectionKey key) throws IOException {
+            ServerSocketChannel serverSocketChannel = (ServerSocketChannel) key.channel();
+            SocketChannel socketChannel = serverSocketChannel.accept();
+            socketChannel.configureBlocking(false);
+            System.out.println("Accept connection from " + socketChannel.socket().getInetAddress().getHostAddress());
+
+            // Start waiting for user input
+            socketChannel.register(this.selector, SelectionKey.OP_READ);
+        }
+
     }
 
-    public static class Payload {
+    public static class Message {
         private final SocketChannel channel;
         private final String text;
-        private final Long resetCounter;
 
-        public Payload(SocketChannel channel, String text, Long resetCounter) {
+        public Message(SocketChannel channel, String text) {
             this.channel = channel;
-            this.resetCounter = resetCounter;
             this.text = text;
         }
 
@@ -180,13 +210,11 @@ public class TflyServer {
             return channel;
         }
 
-        public Long getResetCounter() {
-            return resetCounter;
-        }
 
         public String getText() {
             return text;
         }
+
     }
 
     public static void main(String[] args) {
