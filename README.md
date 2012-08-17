@@ -12,3 +12,4 @@ To connect: `telnet localhost 4567`
 
 You can press ctrl-D in telnet to close connection.
 
+To generate source JAR: `mvn source;jar`
